@@ -26,7 +26,6 @@ type segmentsTree struct {
 }
 
 // newSegmentsIndex creates a segmentsTree node which is the root.
-// The paths argument is used for testing; it auto-adds those to the tree.
 func newSegmentsIndex(paths ...string) *segmentsTree {
 	st := newSegmentsIndexNode(true)
 	for _, path := range paths {
