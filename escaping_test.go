@@ -8,7 +8,7 @@ func TestReadMemberName(t *testing.T) {
 	j := `{"😀💋😺": 1, "x\u0078\ud83d\udc8by": "2"}`
 	m := fakeMatcher("😀💋😺", `xx💋y`)
 	f := newJSONFlattener()
-	fields, err := f.Flatten([]byte(j), m.getSegmentsTreeTracker())
+	fields, err := f.Flatten([]byte(j), m)
 	if err != nil {
 		t.Error("TRMN: " + err.Error())
 	}
@@ -26,7 +26,7 @@ func TestReadMemberName(t *testing.T) {
 func TestStringValuesWithEscapes(t *testing.T) {
 	j := `{"a": "x\u0078\ud83d\udc8by", "b": "\ud83d\ude00\ud83d\udc8b\ud83d\ude3a"}`
 	f := newJSONFlattener()
-	fields, err := f.Flatten([]byte(j), fakeMatcher("a", "b").getSegmentsTreeTracker())
+	fields, err := f.Flatten([]byte(j), fakeMatcher("a", "b"))
 	if err != nil {
 		t.Error("TSVWE: " + err.Error())
 	}
