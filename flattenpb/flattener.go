@@ -12,50 +12,61 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
+// msgSchema holds the pre-built lookup tables for a single message type.
+type msgSchema struct {
+	// byNum maps field number to its descriptor.
+	byNum map[protowire.Number]protoreflect.FieldDescriptor
+	// nameBytes maps field number to the UTF-8 field name as a []byte, cached to
+	// avoid allocating on every Flatten call.
+	nameBytes map[protowire.Number][]byte
+}
+
 // Flattener implements quamina.Flattener for binary-encoded protobuf messages.
 // Construct one with New; it is not safe for concurrent use across goroutines
 // without calling Copy first.
 type Flattener struct {
-	desc protoreflect.MessageDescriptor
-	// allByNum maps each message type's full name to its field-number→descriptor map,
-	// pre-built at construction time for the root message and all transitively
-	// reachable nested message types.
-	allByNum map[protoreflect.FullName]map[protowire.Number]protoreflect.FieldDescriptor
+	desc       protoreflect.MessageDescriptor
+	// allSchemas maps each message type's full name to its pre-built schema,
+	// covering the root message and all transitively reachable nested types.
+	allSchemas map[protoreflect.FullName]*msgSchema
 
 	// reused across Flatten calls to reduce allocations
-	fields    []quamina.Field
-	nextArray int32
+	fields      []quamina.Field
+	valBuf      []byte           // backing buffer for all Val slices
+	arrayPosBuf []quamina.ArrayPos // backing buffer for all ArrayTrail slices
+	nextArray   int32
 }
 
 // New creates a Flattener for the given MessageDescriptor.
 func New(desc protoreflect.MessageDescriptor) *Flattener {
-	allByNum := make(map[protoreflect.FullName]map[protowire.Number]protoreflect.FieldDescriptor)
-	buildAllByNum(desc, allByNum)
+	allSchemas := make(map[protoreflect.FullName]*msgSchema)
+	buildAllSchemas(desc, allSchemas)
 	return &Flattener{
-		desc:     desc,
-		allByNum: allByNum,
-		fields:   make([]quamina.Field, 0, 32),
+		desc:       desc,
+		allSchemas: allSchemas,
+		fields:     make([]quamina.Field, 0, 32),
 	}
 }
 
-// buildAllByNum recursively builds field-number→descriptor maps for desc and all
-// transitively reachable message types, storing them in out. Cycles are detected via
-// the out map.
-func buildAllByNum(
-	desc protoreflect.MessageDescriptor,
-	out map[protoreflect.FullName]map[protowire.Number]protoreflect.FieldDescriptor,
-) {
+// buildAllSchemas recursively builds msgSchema entries for desc and all transitively
+// reachable message types, storing them in out. Cycles are detected via the out map.
+func buildAllSchemas(desc protoreflect.MessageDescriptor, out map[protoreflect.FullName]*msgSchema) {
 	if _, seen := out[desc.FullName()]; seen {
 		return
 	}
 	fds := desc.Fields()
-	m := make(map[protowire.Number]protoreflect.FieldDescriptor, fds.Len())
-	out[desc.FullName()] = m
+	schema := &msgSchema{
+		byNum:     make(map[protowire.Number]protoreflect.FieldDescriptor, fds.Len()),
+		nameBytes: make(map[protowire.Number][]byte, fds.Len()),
+	}
+	out[desc.FullName()] = schema
 	for i := range fds.Len() {
 		fd := fds.Get(i)
-		m[protowire.Number(fd.Number())] = fd
+		num := protowire.Number(fd.Number())
+		schema.byNum[num] = fd
+		schema.nameBytes[num] = []byte(fd.Name())
 		if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
-			buildAllByNum(fd.Message(), out)
+			buildAllSchemas(fd.Message(), out)
 		}
 	}
 }
@@ -68,6 +79,8 @@ func (f *Flattener) Copy() quamina.Flattener {
 // Flatten implements quamina.Flattener.
 func (f *Flattener) Flatten(event []byte, tracker quamina.SegmentsTreeTracker) ([]quamina.Field, error) {
 	f.fields = f.fields[:0]
+	f.valBuf = f.valBuf[:0]
+	f.arrayPosBuf = f.arrayPosBuf[:0]
 	f.nextArray = 0
 	err := f.flattenMsg(event, f.desc, tracker, nil)
 	return f.fields, err
@@ -105,11 +118,15 @@ func (a *fieldArrays) nextPos(num protowire.Number) int32 {
 	return pos
 }
 
-// trail returns parent with a new ArrayPos for field num appended.
-func (a *fieldArrays) trail(num protowire.Number, parent []quamina.ArrayPos, nextArray *int32) []quamina.ArrayPos {
+// trail appends a new ArrayPos for field num to buf, copies parent into buf first,
+// and returns the resulting sub-slice. buf is the Flattener's arrayPosBuf.
+func (a *fieldArrays) trail(num protowire.Number, parent []quamina.ArrayPos, buf *[]quamina.ArrayPos, nextArray *int32) []quamina.ArrayPos {
 	id := a.arrayID(num, nextArray)
 	pos := a.nextPos(num)
-	return appendArrayPos(parent, quamina.ArrayPos{Array: id, Pos: pos})
+	start := len(*buf)
+	*buf = append(*buf, parent...)
+	*buf = append(*buf, quamina.ArrayPos{Array: id, Pos: pos})
+	return (*buf)[start:]
 }
 
 // flattenMsg recursively parses a protobuf-encoded message, emitting quamina Fields for
@@ -120,7 +137,7 @@ func (f *Flattener) flattenMsg(
 	tracker quamina.SegmentsTreeTracker,
 	arrayTrail []quamina.ArrayPos,
 ) error {
-	byNum := f.allByNum[desc.FullName()]
+	schema := f.allSchemas[desc.FullName()]
 	var arrays fieldArrays
 
 	for len(data) > 0 {
@@ -130,7 +147,7 @@ func (f *Flattener) flattenMsg(
 		}
 		data = data[n:]
 
-		fd, ok := byNum[num]
+		fd, ok := schema.byNum[num]
 		if !ok {
 			// Unknown field — consume and skip.
 			n = protowire.ConsumeFieldValue(num, typ, data)
@@ -141,7 +158,7 @@ func (f *Flattener) flattenMsg(
 			continue
 		}
 
-		name := []byte(string(fd.Name()))
+		name := schema.nameBytes[num]
 		if !tracker.IsSegmentUsed(name) {
 			n = protowire.ConsumeFieldValue(num, typ, data)
 			if n < 0 {
@@ -158,7 +175,7 @@ func (f *Flattener) flattenMsg(
 
 		var fieldTrail []quamina.ArrayPos
 		if fd.IsList() && !isPackedRepeated {
-			fieldTrail = arrays.trail(num, arrayTrail, &f.nextArray)
+			fieldTrail = arrays.trail(num, arrayTrail, &f.arrayPosBuf, &f.nextArray)
 		} else {
 			fieldTrail = arrayTrail
 		}
@@ -193,9 +210,11 @@ func (f *Flattener) dispatchField(
 		}
 		data = data[n:]
 		if path := tracker.PathForSegment(name); path != nil {
-			val, isNum := encodeVarint(fd, v)
+			start := len(f.valBuf)
+			var isNum bool
+			f.valBuf, isNum = appendVarint(f.valBuf, fd, v)
 			f.fields = append(f.fields, quamina.Field{
-				Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
+				Path: path, Val: f.valBuf[start:], ArrayTrail: fieldTrail, IsNumber: isNum,
 			})
 		}
 
@@ -206,9 +225,11 @@ func (f *Flattener) dispatchField(
 		}
 		data = data[n:]
 		if path := tracker.PathForSegment(name); path != nil {
-			val, isNum := encodeFixed32(fd, v)
+			start := len(f.valBuf)
+			var isNum bool
+			f.valBuf, isNum = appendFixed32(f.valBuf, fd, v)
 			f.fields = append(f.fields, quamina.Field{
-				Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
+				Path: path, Val: f.valBuf[start:], ArrayTrail: fieldTrail, IsNumber: isNum,
 			})
 		}
 
@@ -219,9 +240,11 @@ func (f *Flattener) dispatchField(
 		}
 		data = data[n:]
 		if path := tracker.PathForSegment(name); path != nil {
-			val, isNum := encodeFixed64(fd, v)
+			start := len(f.valBuf)
+			var isNum bool
+			f.valBuf, isNum = appendFixed64(f.valBuf, fd, v)
 			f.fields = append(f.fields, quamina.Field{
-				Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
+				Path: path, Val: f.valBuf[start:], ArrayTrail: fieldTrail, IsNumber: isNum,
 			})
 		}
 
@@ -248,20 +271,21 @@ func (f *Flattener) dispatchField(
 
 		case protoreflect.StringKind:
 			if path := tracker.PathForSegment(name); path != nil {
-				val := make([]byte, len(b)+2)
-				val[0] = '"'
-				copy(val[1:], b)
-				val[len(b)+1] = '"'
+				start := len(f.valBuf)
+				f.valBuf = append(f.valBuf, '"')
+				f.valBuf = append(f.valBuf, b...)
+				f.valBuf = append(f.valBuf, '"')
 				f.fields = append(f.fields, quamina.Field{
-					Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: false,
+					Path: path, Val: f.valBuf[start:], ArrayTrail: fieldTrail, IsNumber: false,
 				})
 			}
 
 		case protoreflect.BytesKind:
 			if path := tracker.PathForSegment(name); path != nil {
-				encoded := base64.StdEncoding.EncodeToString(b)
+				start := len(f.valBuf)
+				f.valBuf = base64.StdEncoding.AppendEncode(f.valBuf, b)
 				f.fields = append(f.fields, quamina.Field{
-					Path: path, Val: []byte(encoded), ArrayTrail: fieldTrail, IsNumber: false,
+					Path: path, Val: f.valBuf[start:], ArrayTrail: fieldTrail, IsNumber: false,
 				})
 			}
 
@@ -413,9 +437,11 @@ func (f *Flattener) emitMapValue(
 		}
 		_ = n
 		if path := mapTracker.PathForSegment(keyBytes); path != nil {
-			val, isNum := encodeVarint(valFd, v)
+			start := len(f.valBuf)
+			var isNum bool
+			f.valBuf, isNum = appendVarint(f.valBuf, valFd, v)
 			f.fields = append(f.fields, quamina.Field{
-				Path: path, Val: val, ArrayTrail: arrayTrail, IsNumber: isNum,
+				Path: path, Val: f.valBuf[start:], ArrayTrail: arrayTrail, IsNumber: isNum,
 			})
 		}
 	case protowire.Fixed32Type:
@@ -425,9 +451,11 @@ func (f *Flattener) emitMapValue(
 		}
 		_ = n
 		if path := mapTracker.PathForSegment(keyBytes); path != nil {
-			val, isNum := encodeFixed32(valFd, v)
+			start := len(f.valBuf)
+			var isNum bool
+			f.valBuf, isNum = appendFixed32(f.valBuf, valFd, v)
 			f.fields = append(f.fields, quamina.Field{
-				Path: path, Val: val, ArrayTrail: arrayTrail, IsNumber: isNum,
+				Path: path, Val: f.valBuf[start:], ArrayTrail: arrayTrail, IsNumber: isNum,
 			})
 		}
 	case protowire.Fixed64Type:
@@ -437,9 +465,11 @@ func (f *Flattener) emitMapValue(
 		}
 		_ = n
 		if path := mapTracker.PathForSegment(keyBytes); path != nil {
-			val, isNum := encodeFixed64(valFd, v)
+			start := len(f.valBuf)
+			var isNum bool
+			f.valBuf, isNum = appendFixed64(f.valBuf, valFd, v)
 			f.fields = append(f.fields, quamina.Field{
-				Path: path, Val: val, ArrayTrail: arrayTrail, IsNumber: isNum,
+				Path: path, Val: f.valBuf[start:], ArrayTrail: arrayTrail, IsNumber: isNum,
 			})
 		}
 	case protowire.BytesType:
@@ -455,19 +485,20 @@ func (f *Flattener) emitMapValue(
 			}
 		case protoreflect.StringKind:
 			if path := mapTracker.PathForSegment(keyBytes); path != nil {
-				val := make([]byte, len(b)+2)
-				val[0] = '"'
-				copy(val[1:], b)
-				val[len(b)+1] = '"'
+				start := len(f.valBuf)
+				f.valBuf = append(f.valBuf, '"')
+				f.valBuf = append(f.valBuf, b...)
+				f.valBuf = append(f.valBuf, '"')
 				f.fields = append(f.fields, quamina.Field{
-					Path: path, Val: val, ArrayTrail: arrayTrail, IsNumber: false,
+					Path: path, Val: f.valBuf[start:], ArrayTrail: arrayTrail, IsNumber: false,
 				})
 			}
 		case protoreflect.BytesKind:
 			if path := mapTracker.PathForSegment(keyBytes); path != nil {
-				encoded := base64.StdEncoding.EncodeToString(b)
+				start := len(f.valBuf)
+				f.valBuf = base64.StdEncoding.AppendEncode(f.valBuf, b)
 				f.fields = append(f.fields, quamina.Field{
-					Path: path, Val: []byte(encoded), ArrayTrail: arrayTrail, IsNumber: false,
+					Path: path, Val: f.valBuf[start:], ArrayTrail: arrayTrail, IsNumber: false,
 				})
 			}
 		}
@@ -486,7 +517,7 @@ func (f *Flattener) decodePacked(
 ) error {
 	aid := arrays.arrayID(num, &f.nextArray)
 	for len(packed) > 0 {
-		var val []byte
+		valStart := len(f.valBuf)
 		var isNum bool
 
 		switch fd.Kind() {
@@ -496,7 +527,7 @@ func (f *Flattener) decodePacked(
 				return protowire.ParseError(n)
 			}
 			packed = packed[n:]
-			val, isNum = encodeFixed32(fd, v)
+			f.valBuf, isNum = appendFixed32(f.valBuf, fd, v)
 
 		case protoreflect.DoubleKind, protoreflect.Fixed64Kind, protoreflect.Sfixed64Kind:
 			v, n := protowire.ConsumeFixed64(packed)
@@ -504,7 +535,7 @@ func (f *Flattener) decodePacked(
 				return protowire.ParseError(n)
 			}
 			packed = packed[n:]
-			val, isNum = encodeFixed64(fd, v)
+			f.valBuf, isNum = appendFixed64(f.valBuf, fd, v)
 
 		default:
 			v, n := protowire.ConsumeVarint(packed)
@@ -512,24 +543,21 @@ func (f *Flattener) decodePacked(
 				return protowire.ParseError(n)
 			}
 			packed = packed[n:]
-			val, isNum = encodeVarint(fd, v)
+			f.valBuf, isNum = appendVarint(f.valBuf, fd, v)
 		}
 
 		pos := arrays.nextPos(num)
-		trail := appendArrayPos(arrayTrail, quamina.ArrayPos{Array: aid, Pos: pos})
+		trailStart := len(f.arrayPosBuf)
+		f.arrayPosBuf = append(f.arrayPosBuf, arrayTrail...)
+		f.arrayPosBuf = append(f.arrayPosBuf, quamina.ArrayPos{Array: aid, Pos: pos})
 		f.fields = append(f.fields, quamina.Field{
-			Path: path, Val: val, ArrayTrail: trail, IsNumber: isNum,
+			Path:       path,
+			Val:        f.valBuf[valStart:],
+			ArrayTrail: f.arrayPosBuf[trailStart:],
+			IsNumber:   isNum,
 		})
 	}
 	return nil
-}
-
-// appendArrayPos returns a new slice with ap appended to trail.
-func appendArrayPos(trail []quamina.ArrayPos, ap quamina.ArrayPos) []quamina.ArrayPos {
-	result := make([]quamina.ArrayPos, len(trail)+1)
-	copy(result, trail)
-	result[len(trail)] = ap
-	return result
 }
 
 // isScalarKind reports whether a field kind uses a scalar (non-message, non-string, non-bytes) encoding.
@@ -542,71 +570,61 @@ func isScalarKind(k protoreflect.Kind) bool {
 	return true
 }
 
-// encodeVarint converts a raw varint wire value to its quamina Val representation.
-func encodeVarint(fd protoreflect.FieldDescriptor, v uint64) ([]byte, bool) {
+// appendVarint appends the quamina Val representation of a varint field to buf.
+func appendVarint(buf []byte, fd protoreflect.FieldDescriptor, v uint64) ([]byte, bool) {
 	switch fd.Kind() {
 	case protoreflect.BoolKind:
-		if v != 0 {
-			return []byte("true"), false
-		}
-		return []byte("false"), false
+		return strconv.AppendBool(buf, v != 0), false
 
 	case protoreflect.EnumKind:
 		ev := fd.Enum().Values().ByNumber(protoreflect.EnumNumber(v))
 		if ev == nil {
-			return []byte(strconv.FormatInt(int64(v), 10)), true
+			return strconv.AppendInt(buf, int64(v), 10), true
 		}
-		name := string(ev.Name())
-		out := make([]byte, len(name)+2)
-		out[0] = '"'
-		copy(out[1:], name)
-		out[len(name)+1] = '"'
-		return out, false
+		buf = append(buf, '"')
+		buf = append(buf, ev.Name()...)
+		buf = append(buf, '"')
+		return buf, false
 
 	case protoreflect.Sint32Kind:
 		decoded := protowire.DecodeZigZag(v & 0xFFFFFFFF)
-		return []byte(strconv.FormatInt(int64(int32(decoded)), 10)), true
+		return strconv.AppendInt(buf, int64(int32(decoded)), 10), true
 
 	case protoreflect.Sint64Kind:
-		decoded := protowire.DecodeZigZag(v)
-		return []byte(strconv.FormatInt(decoded, 10)), true
+		return strconv.AppendInt(buf, protowire.DecodeZigZag(v), 10), true
 
 	case protoreflect.Int32Kind:
-		return []byte(strconv.FormatInt(int64(int32(v)), 10)), true
+		return strconv.AppendInt(buf, int64(int32(v)), 10), true
 
 	case protoreflect.Int64Kind:
-		return []byte(strconv.FormatInt(int64(v), 10)), true
+		return strconv.AppendInt(buf, int64(v), 10), true
 
 	default:
 		// uint32, uint64, and anything else that uses varint
-		return []byte(strconv.FormatUint(v, 10)), true
+		return strconv.AppendUint(buf, v, 10), true
 	}
 }
 
-// encodeFixed32 converts a raw fixed32 wire value to its quamina Val representation.
-func encodeFixed32(fd protoreflect.FieldDescriptor, v uint32) ([]byte, bool) {
+// appendFixed32 appends the quamina Val representation of a fixed32 field to buf.
+func appendFixed32(buf []byte, fd protoreflect.FieldDescriptor, v uint32) ([]byte, bool) {
 	switch fd.Kind() {
 	case protoreflect.FloatKind:
-		f32 := math.Float32frombits(v)
-		return []byte(strconv.FormatFloat(float64(f32), 'g', -1, 32)), true
+		return strconv.AppendFloat(buf, float64(math.Float32frombits(v)), 'g', -1, 32), true
 	case protoreflect.Sfixed32Kind:
-		return []byte(strconv.FormatInt(int64(int32(v)), 10)), true
+		return strconv.AppendInt(buf, int64(int32(v)), 10), true
 	default:
-		// fixed32
-		return []byte(strconv.FormatUint(uint64(v), 10)), true
+		return strconv.AppendUint(buf, uint64(v), 10), true
 	}
 }
 
-// encodeFixed64 converts a raw fixed64 wire value to its quamina Val representation.
-func encodeFixed64(fd protoreflect.FieldDescriptor, v uint64) ([]byte, bool) {
+// appendFixed64 appends the quamina Val representation of a fixed64 field to buf.
+func appendFixed64(buf []byte, fd protoreflect.FieldDescriptor, v uint64) ([]byte, bool) {
 	switch fd.Kind() {
 	case protoreflect.DoubleKind:
-		f64 := math.Float64frombits(v)
-		return []byte(strconv.FormatFloat(f64, 'g', -1, 64)), true
+		return strconv.AppendFloat(buf, math.Float64frombits(v), 'g', -1, 64), true
 	case protoreflect.Sfixed64Kind:
-		return []byte(strconv.FormatInt(int64(v), 10)), true
+		return strconv.AppendInt(buf, int64(v), 10), true
 	default:
-		// fixed64
-		return []byte(strconv.FormatUint(v, 10)), true
+		return strconv.AppendUint(buf, v, 10), true
 	}
 }
