@@ -1,6 +1,4 @@
 // Package flattenpb implements a quamina.Flattener for binary-encoded Protocol Buffer messages.
-// It uses google.golang.org/protobuf/encoding/protowire for efficient wire-format parsing without
-// reflection overhead on the hot path.
 package flattenpb
 
 import (
@@ -18,8 +16,11 @@ import (
 // Construct one with New; it is not safe for concurrent use across goroutines
 // without calling Copy first.
 type Flattener struct {
-	desc  protoreflect.MessageDescriptor
-	byNum map[protowire.Number]protoreflect.FieldDescriptor // top-level, built once at New
+	desc protoreflect.MessageDescriptor
+	// allByNum maps each message type's full name to its field-number→descriptor map,
+	// pre-built at construction time for the root message and all transitively
+	// reachable nested message types.
+	allByNum map[protoreflect.FullName]map[protowire.Number]protoreflect.FieldDescriptor
 
 	// reused across Flatten calls to reduce allocations
 	fields    []quamina.Field
@@ -28,23 +29,35 @@ type Flattener struct {
 
 // New creates a Flattener for the given MessageDescriptor.
 func New(desc protoreflect.MessageDescriptor) *Flattener {
-	f := &Flattener{
-		desc:   desc,
-		byNum:  buildByNum(desc),
-		fields: make([]quamina.Field, 0, 32),
+	allByNum := make(map[protoreflect.FullName]map[protowire.Number]protoreflect.FieldDescriptor)
+	buildAllByNum(desc, allByNum)
+	return &Flattener{
+		desc:     desc,
+		allByNum: allByNum,
+		fields:   make([]quamina.Field, 0, 32),
 	}
-	return f
 }
 
-// buildByNum builds a field-number → descriptor map for the given message descriptor.
-func buildByNum(desc protoreflect.MessageDescriptor) map[protowire.Number]protoreflect.FieldDescriptor {
+// buildAllByNum recursively builds field-number→descriptor maps for desc and all
+// transitively reachable message types, storing them in out. Cycles are detected via
+// the out map.
+func buildAllByNum(
+	desc protoreflect.MessageDescriptor,
+	out map[protoreflect.FullName]map[protowire.Number]protoreflect.FieldDescriptor,
+) {
+	if _, seen := out[desc.FullName()]; seen {
+		return
+	}
 	fds := desc.Fields()
 	m := make(map[protowire.Number]protoreflect.FieldDescriptor, fds.Len())
-	for i := 0; i < fds.Len(); i++ {
+	out[desc.FullName()] = m
+	for i := range fds.Len() {
 		fd := fds.Get(i)
 		m[protowire.Number(fd.Number())] = fd
+		if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
+			buildAllByNum(fd.Message(), out)
+		}
 	}
-	return m
 }
 
 // Copy implements quamina.Flattener.
@@ -56,24 +69,59 @@ func (f *Flattener) Copy() quamina.Flattener {
 func (f *Flattener) Flatten(event []byte, tracker quamina.SegmentsTreeTracker) ([]quamina.Field, error) {
 	f.fields = f.fields[:0]
 	f.nextArray = 0
-	err := f.flattenMsg(event, f.byNum, tracker, nil)
+	err := f.flattenMsg(event, f.desc, tracker, nil)
 	return f.fields, err
+}
+
+// fieldArrays tracks array IDs and per-field positions for repeated fields within a
+// single message. Both maps are keyed by field number: ids maps a field number to its
+// unique array ID, pos maps it to the next unused position index within that array.
+type fieldArrays struct {
+	ids map[protowire.Number]int32
+	pos map[protowire.Number]int32
+}
+
+// arrayID returns the array ID for field num, assigning one if this is the first occurrence.
+func (a *fieldArrays) arrayID(num protowire.Number, nextArray *int32) int32 {
+	if a.ids == nil {
+		a.ids = make(map[protowire.Number]int32)
+	}
+	id, exists := a.ids[num]
+	if !exists {
+		*nextArray++
+		id = *nextArray
+		a.ids[num] = id
+	}
+	return id
+}
+
+// nextPos returns the current position index for field num and increments it.
+func (a *fieldArrays) nextPos(num protowire.Number) int32 {
+	if a.pos == nil {
+		a.pos = make(map[protowire.Number]int32)
+	}
+	pos := a.pos[num]
+	a.pos[num] = pos + 1
+	return pos
+}
+
+// trail returns parent with a new ArrayPos for field num appended.
+func (a *fieldArrays) trail(num protowire.Number, parent []quamina.ArrayPos, nextArray *int32) []quamina.ArrayPos {
+	id := a.arrayID(num, nextArray)
+	pos := a.nextPos(num)
+	return appendArrayPos(parent, quamina.ArrayPos{Array: id, Pos: pos})
 }
 
 // flattenMsg recursively parses a protobuf-encoded message, emitting quamina Fields for
 // every leaf that the tracker considers used.
-//
-// arrayIDs and arrayPos are lazily allocated; they track per-field-number array identity
-// and current position within each repeated field at this message level.
 func (f *Flattener) flattenMsg(
 	data []byte,
-	byNum map[protowire.Number]protoreflect.FieldDescriptor,
+	desc protoreflect.MessageDescriptor,
 	tracker quamina.SegmentsTreeTracker,
 	arrayTrail []quamina.ArrayPos,
 ) error {
-	// Per-message-level array tracking (allocated lazily to avoid cost when no repeated fields).
-	var arrayIDs map[protowire.Number]int32
-	var arrayPos map[protowire.Number]int32
+	byNum := f.allByNum[desc.FullName()]
+	var arrays fieldArrays
 
 	for len(data) > 0 {
 		num, typ, n := protowire.ConsumeTag(data)
@@ -103,139 +151,139 @@ func (f *Flattener) flattenMsg(
 			continue
 		}
 
-		// Detect packed repeated scalars before computing the array trail so we
-		// can handle position-counting per element rather than per blob.
+		// Packed repeated scalars are encoded as a single length-delimited blob containing
+		// multiple concatenated values. Each value within the blob gets its own ArrayPos,
+		// so we defer trail assignment to decodePacked rather than assigning one here.
 		isPackedRepeated := fd.IsList() && typ == protowire.BytesType && isScalarKind(fd.Kind())
 
-		// Compute the array trail for this field occurrence.
 		var fieldTrail []quamina.ArrayPos
 		if fd.IsList() && !isPackedRepeated {
-			if arrayIDs == nil {
-				arrayIDs = make(map[protowire.Number]int32)
-				arrayPos = make(map[protowire.Number]int32)
-			}
-			aid, exists := arrayIDs[num]
-			if !exists {
-				f.nextArray++
-				aid = f.nextArray
-				arrayIDs[num] = aid
-			}
-			pos := arrayPos[num]
-			arrayPos[num] = pos + 1
-			fieldTrail = appendArrayPos(arrayTrail, quamina.ArrayPos{Array: aid, Pos: pos})
+			fieldTrail = arrays.trail(num, arrayTrail, &f.nextArray)
 		} else {
 			fieldTrail = arrayTrail
 		}
 
-		switch typ {
-		case protowire.VarintType:
-			v, n := protowire.ConsumeVarint(data)
-			if n < 0 {
-				return protowire.ParseError(n)
-			}
-			data = data[n:]
-			if path := tracker.PathForSegment(name); path != nil {
-				val, isNum := encodeVarint(fd, v)
-				f.fields = append(f.fields, quamina.Field{
-					Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
-				})
-			}
-
-		case protowire.Fixed32Type:
-			v, n := protowire.ConsumeFixed32(data)
-			if n < 0 {
-				return protowire.ParseError(n)
-			}
-			data = data[n:]
-			if path := tracker.PathForSegment(name); path != nil {
-				val, isNum := encodeFixed32(fd, v)
-				f.fields = append(f.fields, quamina.Field{
-					Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
-				})
-			}
-
-		case protowire.Fixed64Type:
-			v, n := protowire.ConsumeFixed64(data)
-			if n < 0 {
-				return protowire.ParseError(n)
-			}
-			data = data[n:]
-			if path := tracker.PathForSegment(name); path != nil {
-				val, isNum := encodeFixed64(fd, v)
-				f.fields = append(f.fields, quamina.Field{
-					Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
-				})
-			}
-
-		case protowire.BytesType:
-			b, n := protowire.ConsumeBytes(data)
-			if n < 0 {
-				return protowire.ParseError(n)
-			}
-			data = data[n:]
-
-			switch fd.Kind() {
-			case protoreflect.MessageKind, protoreflect.GroupKind:
-				if fd.IsMap() {
-					if err := f.flattenMapEntry(b, fd, tracker, name, fieldTrail); err != nil {
-						return err
-					}
-				} else {
-					if child, ok := tracker.Get(name); ok {
-						childByNum := buildByNum(fd.Message())
-						if err := f.flattenMsg(b, childByNum, child, fieldTrail); err != nil {
-							return err
-						}
-					}
-				}
-
-			case protoreflect.StringKind:
-				if path := tracker.PathForSegment(name); path != nil {
-					val := make([]byte, len(b)+2)
-					val[0] = '"'
-					copy(val[1:], b)
-					val[len(b)+1] = '"'
-					f.fields = append(f.fields, quamina.Field{
-						Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: false,
-					})
-				}
-
-			case protoreflect.BytesKind:
-				if path := tracker.PathForSegment(name); path != nil {
-					encoded := base64.StdEncoding.EncodeToString(b)
-					f.fields = append(f.fields, quamina.Field{
-						Path: path, Val: []byte(encoded), ArrayTrail: fieldTrail, IsNumber: false,
-					})
-				}
-
-			default:
-				// Packed repeated scalar — each element in b is a repeated occurrence.
-				if isPackedRepeated {
-					if arrayIDs == nil {
-						arrayIDs = make(map[protowire.Number]int32)
-						arrayPos = make(map[protowire.Number]int32)
-					}
-					if _, exists := arrayIDs[num]; !exists {
-						f.nextArray++
-						arrayIDs[num] = f.nextArray
-					}
-					if path := tracker.PathForSegment(name); path != nil {
-						if err := f.decodePacked(b, fd, num, path, arrayIDs, arrayPos, arrayTrail); err != nil {
-							return err
-						}
-					}
-				}
-			}
-
-		default:
-			n = protowire.ConsumeFieldValue(num, typ, data)
-			if n < 0 {
-				return protowire.ParseError(n)
-			}
-			data = data[n:]
+		var err error
+		data, err = f.dispatchField(data, fd, num, typ, name, fieldTrail, arrayTrail, &arrays, isPackedRepeated, tracker)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// dispatchField consumes a single field value from data (immediately following the
+// already-consumed tag), emits any matching quamina.Fields, and returns the remaining data.
+func (f *Flattener) dispatchField(
+	data []byte,
+	fd protoreflect.FieldDescriptor,
+	num protowire.Number,
+	typ protowire.Type,
+	name []byte,
+	fieldTrail, arrayTrail []quamina.ArrayPos,
+	arrays *fieldArrays,
+	isPackedRepeated bool,
+	tracker quamina.SegmentsTreeTracker,
+) ([]byte, error) {
+	switch typ {
+	case protowire.VarintType:
+		v, n := protowire.ConsumeVarint(data)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+		if path := tracker.PathForSegment(name); path != nil {
+			val, isNum := encodeVarint(fd, v)
+			f.fields = append(f.fields, quamina.Field{
+				Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
+			})
+		}
+
+	case protowire.Fixed32Type:
+		v, n := protowire.ConsumeFixed32(data)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+		if path := tracker.PathForSegment(name); path != nil {
+			val, isNum := encodeFixed32(fd, v)
+			f.fields = append(f.fields, quamina.Field{
+				Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
+			})
+		}
+
+	case protowire.Fixed64Type:
+		v, n := protowire.ConsumeFixed64(data)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+		if path := tracker.PathForSegment(name); path != nil {
+			val, isNum := encodeFixed64(fd, v)
+			f.fields = append(f.fields, quamina.Field{
+				Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: isNum,
+			})
+		}
+
+	case protowire.BytesType:
+		b, n := protowire.ConsumeBytes(data)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+
+		switch fd.Kind() {
+		case protoreflect.MessageKind, protoreflect.GroupKind:
+			if fd.IsMap() {
+				if err := f.flattenMapEntry(b, fd, tracker, name, fieldTrail); err != nil {
+					return nil, err
+				}
+			} else {
+				if child, ok := tracker.Get(name); ok {
+					if err := f.flattenMsg(b, fd.Message(), child, fieldTrail); err != nil {
+						return nil, err
+					}
+				}
+			}
+
+		case protoreflect.StringKind:
+			if path := tracker.PathForSegment(name); path != nil {
+				val := make([]byte, len(b)+2)
+				val[0] = '"'
+				copy(val[1:], b)
+				val[len(b)+1] = '"'
+				f.fields = append(f.fields, quamina.Field{
+					Path: path, Val: val, ArrayTrail: fieldTrail, IsNumber: false,
+				})
+			}
+
+		case protoreflect.BytesKind:
+			if path := tracker.PathForSegment(name); path != nil {
+				encoded := base64.StdEncoding.EncodeToString(b)
+				f.fields = append(f.fields, quamina.Field{
+					Path: path, Val: []byte(encoded), ArrayTrail: fieldTrail, IsNumber: false,
+				})
+			}
+
+		default:
+			// Packed repeated scalar — each element within b is a separate occurrence.
+			if isPackedRepeated {
+				if path := tracker.PathForSegment(name); path != nil {
+					if err := f.decodePacked(b, fd, num, path, arrays, arrayTrail); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+
+	default:
+		n := protowire.ConsumeFieldValue(num, typ, data)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+	}
+	return data, nil
 }
 
 // flattenMapEntry parses a single map-entry message (key=1, value=2) and emits the value
@@ -403,8 +451,7 @@ func (f *Flattener) emitMapValue(
 		switch valFd.Kind() {
 		case protoreflect.MessageKind, protoreflect.GroupKind:
 			if child, ok := mapTracker.Get(keyBytes); ok {
-				childByNum := buildByNum(valFd.Message())
-				return f.flattenMsg(b, childByNum, child, arrayTrail)
+				return f.flattenMsg(b, valFd.Message(), child, arrayTrail)
 			}
 		case protoreflect.StringKind:
 			if path := mapTracker.PathForSegment(keyBytes); path != nil {
@@ -434,11 +481,10 @@ func (f *Flattener) decodePacked(
 	fd protoreflect.FieldDescriptor,
 	num protowire.Number,
 	path []byte,
-	arrayIDs map[protowire.Number]int32,
-	arrayPos map[protowire.Number]int32,
+	arrays *fieldArrays,
 	arrayTrail []quamina.ArrayPos,
 ) error {
-	aid := arrayIDs[num]
+	aid := arrays.arrayID(num, &f.nextArray)
 	for len(packed) > 0 {
 		var val []byte
 		var isNum bool
@@ -469,8 +515,7 @@ func (f *Flattener) decodePacked(
 			val, isNum = encodeVarint(fd, v)
 		}
 
-		pos := arrayPos[num]
-		arrayPos[num] = pos + 1
+		pos := arrays.nextPos(num)
 		trail := appendArrayPos(arrayTrail, quamina.ArrayPos{Array: aid, Pos: pos})
 		f.fields = append(f.fields, quamina.Field{
 			Path: path, Val: val, ArrayTrail: trail, IsNumber: isNum,
